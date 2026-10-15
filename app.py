@@ -15,19 +15,23 @@ Routing thresholds (common/schemas.py):
 from __future__ import annotations
 
 import asyncio
+import sys
 import uuid
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 import streamlit as st
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from common.db import db_path
-# TODO: import the graph builder + helpers from your exercise 4 solution.
-# Suggestion: rename `exercises/exercise_4_audit.py` functions you need
-# (build_graph, handle_interrupt logic) and import them here, OR copy the
-# graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
+from common.db import db_conn, db_path
+from exercises.exercise_4_audit import build_graph
 
 
 load_dotenv()
@@ -44,6 +48,30 @@ if "final" not in st.session_state:
     st.session_state.final = None
 
 
+# ─── Helper for recent sessions ───────────────────────────────────────────
+async def get_recent_sessions():
+    try:
+        async with db_conn() as conn:
+            async with conn.execute(
+                """
+                SELECT thread_id,
+                       pr_url,
+                       MIN(timestamp)        AS started,
+                       MAX(timestamp)        AS last_event,
+                       MAX(risk_level)       AS worst_risk,
+                       COUNT(*)              AS events
+                  FROM audit_events
+                 GROUP BY thread_id, pr_url
+                 ORDER BY MAX(timestamp) DESC
+                 LIMIT 25
+                """
+            ) as cur:
+                rows = await cur.fetchall()
+                return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
 # ─── Page setup ────────────────────────────────────────────────────────────
 st.set_page_config(page_title="HITL PR Review", layout="wide")
 st.title("HITL PR Review Agent")
@@ -52,10 +80,24 @@ st.title("HITL PR Review Agent")
 # ─── Sidebar — recent sessions ─────────────────────────────────────────────
 with st.sidebar:
     st.header("Recent sessions")
-    # TODO: call `audit.replay.list_threads`-style query against audit_events
-    # and render thread_id + pr_url + worst_risk + last_event as a small table.
-    # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+    recent = asyncio.run(get_recent_sessions())
+    if not recent:
+        st.caption("No sessions yet in audit trail.")
+    else:
+        for s in recent:
+            tid = s["thread_id"]
+            short_tid = tid[:8]
+            risk = s.get("worst_risk", "med")
+            pr_label = s["pr_url"].split("/")[-1] if "/" in s["pr_url"] else s["pr_url"]
+            last_time = s.get("last_event", "")[:19].replace("T", " ")
+            btn_label = f"#{pr_label} ({risk}) — `{short_tid}`"
+            if st.button(btn_label, key=f"session_{tid}"):
+                st.session_state.thread_id = tid
+                st.session_state.pr_url = s["pr_url"]
+                st.session_state.interrupt_payload = None
+                st.session_state.final = None
+                st.rerun()
+            st.caption(f"Last event: {last_time} ({s.get('events', 0)} events)")
 
 
 # ─── Top form — start a new review ─────────────────────────────────────────
@@ -83,16 +125,12 @@ def render_approval_card(payload: dict) -> dict | None:
 
     feedback = st.text_input("Feedback (optional)", key="approval_feedback")
     col1, col2, col3 = st.columns(3)
-    # TODO: hook up the three buttons. Each click should return one of:
-    #   {"choice": "approve", "feedback": feedback}
-    #   {"choice": "reject",  "feedback": feedback}
-    #   {"choice": "edit",    "feedback": feedback}
     if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
+        return {"choice": "approve", "feedback": feedback}
     if col2.button("Reject"):
-        ...
+        return {"choice": "reject", "feedback": feedback}
     if col3.button("Edit"):
-        ...
+        return {"choice": "edit", "feedback": feedback}
     return None
 
 
@@ -106,11 +144,12 @@ def render_escalation_card(payload: dict) -> dict | None:
     st.markdown(payload["summary"])
 
     with st.form("escalation"):
-        # TODO: render one text_input per question in payload["questions"]
-        #       collect answers into a dict {question: answer_str}
-        #       on submit, return the dict.
         answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
+        for i, q in enumerate(payload.get("questions", [])):
+            answers[q] = st.text_input(q, key=f"esc_q_{i}")
+        submitted_esc = st.form_submit_button("Submit answers")
+        if submitted_esc:
+            return answers
     return None
 
 
@@ -119,18 +158,14 @@ async def run_graph(pr_url: str, thread_id: str, resume_value=None):
     """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
     async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
         await cp.setup()
-        # TODO: build the graph with `cp` as the checkpointer (use the function
-        # you imported/copied at the top of this file).
-        # app = build_graph(cp)
+        app = build_graph(cp)
         cfg = {"configurable": {"thread_id": thread_id}}
 
-        # TODO:
-        # - If resume_value is None: result = await app.ainvoke(
-        #       {"pr_url": pr_url, "thread_id": thread_id}, cfg)
-        # - Else:                    result = await app.ainvoke(
-        #       Command(resume=resume_value), cfg)
-        # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
+        if resume_value is None:
+            result = await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+        else:
+            result = await app.ainvoke(Command(resume=resume_value), cfg)
+        return result
 
 
 # ─── Main flow ─────────────────────────────────────────────────────────────
@@ -169,8 +204,18 @@ if payload is not None:
 if st.session_state.final is not None:
     final = st.session_state.final
     action = final.get("final_action", "?")
+    analysis = final.get("analysis")
+
     if action.startswith("auto") or action.startswith("committed"):
         st.success(f"✓ {action} — comment posted to {st.session_state.pr_url}")
+        if analysis:
+            st.markdown(f"**Confidence:** {analysis.confidence:.0%}")
+            st.markdown(f"**Summary:** {analysis.summary}")
+            if analysis.comments:
+                with st.expander("Review comments posted"):
+                    for c in analysis.comments:
+                        st.markdown(f"- **[{c.severity}]** `{c.file}:{c.line or '?'}` — {c.body}")
+        st.markdown(f"👉 [View PR on GitHub]({st.session_state.pr_url})")
     elif action == "rejected":
         st.warning("Rejected — no comment posted")
     else:
